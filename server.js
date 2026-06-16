@@ -150,4 +150,94 @@ app.get('/api/agencias', async (req, res) => {
   }
 });
 
+// ========== SYNC: Verificar estados reales desde shalom.com.pe ==========
+app.post('/api/sync', async (req, res) => {
+  const puppeteer = require('puppeteer-core');
+  let browser;
+  
+  try {
+    // Buscar pedidos que NO estan entregados
+    const { data: pendientes, error } = await supabase
+      .from('pedidos')
+      .select('id, n_orden, cod_seguimiento, estado')
+      .neq('estado', 'ENTREGADO');
+
+    if (error) throw error;
+    if (!pendientes || pendientes.length === 0) {
+      return res.json({ message: 'Todos los pedidos ya estan entregados', updated: 0 });
+    }
+
+    console.log(`[SYNC] Verificando ${pendientes.length} pedidos...`);
+
+    browser = await puppeteer.launch({
+      executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+
+    const page = await browser.newPage();
+    let updated = 0;
+    const results = [];
+
+    for (const pedido of pendientes) {
+      try {
+        // Ir a la pagina de rastreo publico
+        await page.goto(`https://shalom.com.pe/rastrea`, { waitUntil: 'networkidle2', timeout: 15000 });
+        await page.waitForTimeout(2000);
+
+        // Llenar N° de Orden
+        const inputs = await page.$$('input');
+        if (inputs.length >= 2) {
+          await inputs[0].click({ clickCount: 3 });
+          await inputs[0].type(pedido.n_orden);
+          await inputs[1].click({ clickCount: 3 });
+          await inputs[1].type(pedido.cod_seguimiento);
+        }
+
+        // Click Buscar
+        const buscarBtn = await page.$('button.btn-search, button[type="submit"], .btn-buscar');
+        if (buscarBtn) await buscarBtn.click();
+        else {
+          const buttons = await page.$$('button');
+          for (const btn of buttons) {
+            const text = await btn.evaluate(el => el.textContent);
+            if (text.includes('Buscar')) { await btn.click(); break; }
+          }
+        }
+
+        await page.waitForTimeout(4000);
+
+        // Leer el estado del texto grande
+        const pageText = await page.evaluate(() => document.body.innerText);
+        
+        let realStatus = null;
+        if (pageText.includes('Entregado')) realStatus = 'ENTREGADO';
+        else if (pageText.includes('En destino')) realStatus = 'EN_DESTINO';
+        else if (pageText.includes('En tránsito') || pageText.includes('En transito')) realStatus = 'EN_TRANSITO';
+        else if (pageText.includes('En origen')) realStatus = 'ENVIADO';
+
+        if (realStatus && realStatus !== pedido.estado) {
+          await supabase.from('pedidos').update({ estado: realStatus }).eq('id', pedido.id);
+          console.log(`[SYNC] ${pedido.n_orden}: ${pedido.estado} -> ${realStatus}`);
+          updated++;
+          results.push({ orden: pedido.n_orden, antes: pedido.estado, ahora: realStatus });
+        } else {
+          results.push({ orden: pedido.n_orden, estado: pedido.estado, cambio: false });
+        }
+      } catch (err) {
+        console.log(`[SYNC ERR] ${pedido.n_orden}: ${err.message}`);
+        results.push({ orden: pedido.n_orden, error: err.message });
+      }
+    }
+
+    await browser.close();
+    console.log(`[SYNC] Completado. ${updated} actualizados.`);
+    res.json({ message: `Sync completado`, total: pendientes.length, updated, results });
+  } catch (err) {
+    if (browser) await browser.close();
+    console.error('[SYNC ERR]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 process.on('uncaughtException', (err) => console.error('[FATAL]', err));
