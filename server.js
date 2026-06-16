@@ -13,7 +13,7 @@ app.use(express.json());
 
 // Iniciar servidor de inmediato (Cloud Run necesita esto)
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Shalom Backend Pro corriendo en puerto ${PORT}`);
+  console.log(`[SERVER] Shalom Backend Pro corriendo en puerto ${PORT}`);
 });
 
 // ========== SUPABASE ==========
@@ -70,10 +70,10 @@ app.post('/api/pedido', auth, async (req, res) => {
 
     if (error) throw error;
 
-    console.log(`📦 Pedido #${pedido.id}: ${cliente_nombre} → ${producto.nombre_corto} x${cantidad}`);
+    console.log(`[PEDIDO] #${pedido.id}: ${cliente_nombre} > ${producto.nombre_corto} x${cantidad}`);
     res.status(201).json({ success: true, pedido_id: pedido.id, pedido });
   } catch (err) {
-    console.error('❌', err.message);
+    console.error('[ERROR]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -83,7 +83,7 @@ app.get('/api/pedidos', async (req, res) => {
   try {
     const { estado, limit = 100 } = req.query;
 
-    let query = supabase.from('pedidos').select('*, productos(*)').order('created_at', { ascending: false }).limit(limit);
+    let query = supabase.from('pedidos').select('*, productos(*)').order('n_orden', { ascending: false }).limit(limit);
 
     if (estado && estado !== 'TODOS') {
       query = query.eq('estado', estado);
@@ -125,7 +125,6 @@ app.get('/api/productos', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('productos').select('*').eq('activo', true).order('nombre_corto');
-
     if (error) throw error;
     res.json({ total: data.length, productos: data });
   } catch (err) {
@@ -151,4 +150,4 @@ app.get('/api/agencias', async (req, res) => {
   }
 });
 
-process.on('uncaughtException', (err) => console.error('🔥 Error:', err));
+process.on('uncaughtException', (err) => console.error('[FATAL]', err));
