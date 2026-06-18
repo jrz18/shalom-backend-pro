@@ -16,15 +16,15 @@ async function main() {
   const page = await ctx.newPage();
 
   await page.goto('https://pro.shalom.pe/login');
-  await page.waitForTimeout(2000);
+  await new Promise(r => setTimeout(r, 2000));
   await page.fill('input[name="email"]', process.env.SHALOM_USER);
   await page.fill('input[name="password"]', process.env.SHALOM_PASS);
   await page.click('button[type="submit"]');
-  await page.waitForTimeout(5000);
+  await new Promise(r => setTimeout(r, 5000));
 
   // Ir a seguimiento
   await page.goto('https://pro.shalom.pe/seguimientoenvios');
-  await page.waitForTimeout(3000);
+  await new Promise(r => setTimeout(r, 3000));
   console.log('[LOGIN] OK');
 
   // 2. Scrape de la tabla
@@ -44,7 +44,7 @@ async function main() {
     if (p > 1) {
       try {
         await page.click(`nav a:text-is("${p}"), .pagination a:text-is("${p}")`);
-        await page.waitForTimeout(2000);
+        await new Promise(r => setTimeout(r, 2000));
       } catch (e) {
         console.log('[SCRAPE] No se pudo navegar a pagina', p);
         break;

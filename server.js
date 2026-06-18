@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const ws = require('ws');
+const fs = require('fs');
+const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -44,7 +46,8 @@ app.post('/api/pedido', auth, async (req, res) => {
       cliente_nombre, cliente_dni, cliente_telefono,
       producto_handle, cantidad = 1,
       precio_total, saldo_cobrar,
-      agencia_destino, agencia_id, notas
+      agencia_destino, agencia_id, notas,
+      n_orden, cod_seguimiento
     } = req.body;
 
     if (!cliente_nombre || !producto_handle || !agencia_destino) {
@@ -65,13 +68,31 @@ app.post('/api/pedido', auth, async (req, res) => {
       producto_handle, cantidad,
       precio_total: total, saldo_cobrar: saldo,
       agencia_destino, agencia_id,
+      n_orden: n_orden || null, cod_seguimiento: cod_seguimiento || null,
       estado: 'PENDIENTE', notas
     }).select().single();
 
     if (error) throw error;
 
+    // Lanzar motor API de Shalom en segundo plano (no bloquea respuesta al usuario)
+    const { generarEnvioShalomAPI } = require('./shalom_api_engine');
+    generarEnvioShalomAPI(pedido, producto).then(async (res) => {
+       await supabase.from('pedidos').update({
+         n_orden: res.n_orden,
+         cod_seguimiento: res.cod_seguimiento,
+         estado: 'ENVIADO'
+       }).eq('id', pedido.id);
+       console.log(`[BOT-OK] Pedido #${pedido.id} registrado en Shalom: ${res.n_orden}`);
+    }).catch(async (e) => {
+       console.error(`[BOT-FAIL] Error auto-registro Shalom #${pedido.id}:`, e.message);
+       await supabase.from('pedidos').update({
+         estado: 'ERROR',
+         notas: `Error Shalom: ${e.message}`
+       }).eq('id', pedido.id);
+    });
+
     console.log(`[PEDIDO] #${pedido.id}: ${cliente_nombre} > ${producto.nombre_corto} x${cantidad}`);
-    res.status(201).json({ success: true, pedido_id: pedido.id, pedido });
+    res.status(201).json({ success: true, pedido_id: pedido.id, message: 'Pedido registrado. Procesando envio en Shalom Pro...' });
   } catch (err) {
     console.error('[ERROR]', err.message);
     res.status(500).json({ error: err.message });
@@ -120,6 +141,19 @@ app.patch('/api/pedido/:id', auth, async (req, res) => {
   }
 });
 
+// ========== ELIMINAR PEDIDO ==========
+app.delete('/api/pedido/:id', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase.from('pedidos').delete().eq('id', id);
+    if (error) throw error;
+    console.log(`[DELETE] Pedido ${id} eliminado`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ========== CATALOGO DE PRODUCTOS ==========
 app.get('/api/productos', async (req, res) => {
   try {
@@ -132,109 +166,46 @@ app.get('/api/productos', async (req, res) => {
   }
 });
 
-// ========== AGENCIAS SHALOM ==========
-app.get('/api/agencias', async (req, res) => {
+// ========== AGENCIAS SHALOM (lista real de Shalom, desde agencias.json) ==========
+app.get('/api/agencias', (req, res) => {
   try {
+    const agencias = JSON.parse(fs.readFileSync(path.join(__dirname, 'agencias.json'), 'utf8'));
     const { buscar } = req.query;
-    let query = supabase.from('agencias').select('*').order('distrito');
-
-    if (buscar) {
-      query = query.ilike('distrito', `%${buscar}%`);
-    }
-
-    const { data, error } = await query;
-    if (error) throw error;
-    res.json({ agencias: data || [] });
+    const result = buscar
+      ? agencias.filter(a => a.nombre.toLowerCase().includes(String(buscar).toLowerCase()))
+      : agencias;
+    res.json({ agencias: result });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ========== SYNC: Verificar estados reales desde shalom.com.pe ==========
+// ========== SYNC: Verificar estados reales desde el rastreo de Shalom ==========
 app.post('/api/sync', async (req, res) => {
-  const puppeteer = require('puppeteer-core');
-  let browser;
-  
   try {
-    // Buscar pedidos que NO estan entregados
-    const { data: pendientes, error } = await supabase
+    // Solo los rastreables (los ENTREGADO ya no se tocan)
+    const { data: pedidos, error } = await supabase
       .from('pedidos')
       .select('id, n_orden, cod_seguimiento, estado')
-      .neq('estado', 'ENTREGADO');
+      .in('estado', ['ENVIADO', 'EN_TRANSITO', 'EN_DESTINO']);
 
     if (error) throw error;
-    if (!pendientes || pendientes.length === 0) {
-      return res.json({ message: 'Todos los pedidos ya estan entregados', updated: 0 });
+    if (!pedidos || pedidos.length === 0) {
+      return res.json({ message: 'No hay pedidos en tránsito para verificar', updated: 0, cambios: [] });
     }
 
-    console.log(`[SYNC] Verificando ${pendientes.length} pedidos...`);
+    console.log(`[SYNC] Rastreando ${pedidos.length} pedidos...`);
+    const { leerEstadosRastreo } = require('./shalom_rastreo');
+    const cambios = await leerEstadosRastreo(pedidos);
 
-    browser = await puppeteer.launch({
-      executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-
-    const page = await browser.newPage();
-    let updated = 0;
-    const results = [];
-
-    for (const pedido of pendientes) {
-      try {
-        // Ir a la pagina de rastreo publico
-        await page.goto(`https://shalom.com.pe/rastrea`, { waitUntil: 'networkidle2', timeout: 15000 });
-        await page.waitForTimeout(2000);
-
-        // Llenar N° de Orden
-        const inputs = await page.$$('input');
-        if (inputs.length >= 2) {
-          await inputs[0].click({ clickCount: 3 });
-          await inputs[0].type(pedido.n_orden);
-          await inputs[1].click({ clickCount: 3 });
-          await inputs[1].type(pedido.cod_seguimiento);
-        }
-
-        // Click Buscar
-        const buscarBtn = await page.$('button.btn-search, button[type="submit"], .btn-buscar');
-        if (buscarBtn) await buscarBtn.click();
-        else {
-          const buttons = await page.$$('button');
-          for (const btn of buttons) {
-            const text = await btn.evaluate(el => el.textContent);
-            if (text.includes('Buscar')) { await btn.click(); break; }
-          }
-        }
-
-        await page.waitForTimeout(4000);
-
-        // Leer el estado del texto grande
-        const pageText = await page.evaluate(() => document.body.innerText);
-        
-        let realStatus = null;
-        if (pageText.includes('Entregado')) realStatus = 'ENTREGADO';
-        else if (pageText.includes('En destino')) realStatus = 'EN_DESTINO';
-        else if (pageText.includes('En tránsito') || pageText.includes('En transito')) realStatus = 'EN_TRANSITO';
-        else if (pageText.includes('En origen')) realStatus = 'ENVIADO';
-
-        if (realStatus && realStatus !== pedido.estado) {
-          await supabase.from('pedidos').update({ estado: realStatus }).eq('id', pedido.id);
-          console.log(`[SYNC] ${pedido.n_orden}: ${pedido.estado} -> ${realStatus}`);
-          updated++;
-          results.push({ orden: pedido.n_orden, antes: pedido.estado, ahora: realStatus });
-        } else {
-          results.push({ orden: pedido.n_orden, estado: pedido.estado, cambio: false });
-        }
-      } catch (err) {
-        console.log(`[SYNC ERR] ${pedido.n_orden}: ${err.message}`);
-        results.push({ orden: pedido.n_orden, error: err.message });
-      }
+    for (const c of cambios) {
+      await supabase.from('pedidos').update({ estado: c.ahora }).eq('id', c.id);
+      console.log(`[SYNC] ${c.n_orden}: ${c.antes} -> ${c.ahora}`);
     }
 
-    await browser.close();
-    console.log(`[SYNC] Completado. ${updated} actualizados.`);
-    res.json({ message: `Sync completado`, total: pendientes.length, updated, results });
+    console.log(`[SYNC] Completado. ${cambios.length} actualizados de ${pedidos.length} verificados.`);
+    res.json({ message: 'Sync completado', total: pedidos.length, updated: cambios.length, cambios });
   } catch (err) {
-    if (browser) await browser.close();
     console.error('[SYNC ERR]', err.message);
     res.status(500).json({ error: err.message });
   }

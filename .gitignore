@@ -1,3 +1,7 @@
-﻿sync_log.txt
+sync_log.txt
 node_modules/
 .env
+screenshots/
+*.log
+captura-pedido.json
+captura-*.json
