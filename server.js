@@ -74,25 +74,28 @@ app.post('/api/pedido', auth, async (req, res) => {
 
     if (error) throw error;
 
-    // Lanzar motor API de Shalom en segundo plano (no bloquea respuesta al usuario)
-    const { generarEnvioShalomAPI } = require('./shalom_api_engine');
-    generarEnvioShalomAPI(pedido, producto).then(async (res) => {
-       await supabase.from('pedidos').update({
-         n_orden: res.n_orden,
-         cod_seguimiento: res.cod_seguimiento,
-         estado: 'ENVIADO'
-       }).eq('id', pedido.id);
-       console.log(`[BOT-OK] Pedido #${pedido.id} registrado en Shalom: ${res.n_orden}`);
-    }).catch(async (e) => {
-       console.error(`[BOT-FAIL] Error auto-registro Shalom #${pedido.id}:`, e.message);
-       await supabase.from('pedidos').update({
-         estado: 'ERROR',
-         notas: `Error Shalom: ${e.message}`
-       }).eq('id', pedido.id);
-    });
-
     console.log(`[PEDIDO] #${pedido.id}: ${cliente_nombre} > ${producto.nombre_corto} x${cantidad}`);
-    res.status(201).json({ success: true, pedido_id: pedido.id, message: 'Pedido registrado. Procesando envio en Shalom Pro...' });
+
+    // Crear la guía en Shalom AHORA (síncrono). En Cloud Run el CPU solo está
+    // garantizado durante la petición, así que NO lo dejamos en segundo plano.
+    const { generarEnvioShalomAPI } = require('./shalom_api_engine');
+    try {
+      const guia = await generarEnvioShalomAPI(pedido, producto);
+      await supabase.from('pedidos').update({
+        n_orden: guia.n_orden,
+        cod_seguimiento: guia.cod_seguimiento,
+        estado: 'ENVIADO'
+      }).eq('id', pedido.id);
+      console.log(`[BOT-OK] Pedido #${pedido.id} -> ${guia.n_orden}`);
+      res.status(201).json({ success: true, pedido_id: pedido.id, n_orden: guia.n_orden, estado: 'ENVIADO', message: `Guía ${guia.n_orden} creada` });
+    } catch (e) {
+      console.error(`[BOT-FAIL] #${pedido.id}:`, e.message);
+      await supabase.from('pedidos').update({
+        estado: 'ERROR',
+        notas: `Error Shalom: ${e.message}`
+      }).eq('id', pedido.id);
+      res.status(201).json({ success: true, pedido_id: pedido.id, estado: 'ERROR', message: `Pedido guardado, pero Shalom falló: ${e.message}` });
+    }
   } catch (err) {
     console.error('[ERROR]', err.message);
     res.status(500).json({ error: err.message });

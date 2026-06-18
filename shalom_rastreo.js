@@ -34,7 +34,8 @@ async function leerEstadosRastreo(pedidos) {
     const browser = await puppeteer.launch({
         executablePath: process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        timeout: 60000,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote']
     });
     const cambios = [];
 
