@@ -44,50 +44,64 @@ app.post('/api/pedido', auth, async (req, res) => {
   try {
     const {
       cliente_nombre, cliente_dni, cliente_telefono,
-      producto_handle, cantidad = 1,
-      precio_total, saldo_cobrar,
-      agencia_destino, agencia_id, notas,
-      n_orden, cod_seguimiento
+      producto_handle, anticipo = 0,
+      agencia_destino, agencia_id, origen, notas
     } = req.body;
 
     if (!cliente_nombre || !producto_handle || !agencia_destino) {
       return res.status(400).json({ error: 'Faltan: cliente_nombre, producto_handle, agencia_destino' });
     }
 
-    // Buscar producto
+    // Buscar la variante (producto + color) por su handle
     const { data: producto } = await supabase
       .from('productos').select('*').eq('handle', producto_handle).single();
-
     if (!producto) return res.status(404).json({ error: `Producto "${producto_handle}" no encontrado` });
 
-    const total = precio_total || (producto.precio_unitario * cantidad);
-    const saldo = saldo_cobrar ?? total;
+    // Validar stock de esa variante
+    if ((producto.stock || 0) <= 0) {
+      return res.status(409).json({ error: `Sin stock de ${producto.grupo || producto.nombre_corto} (${producto.color || 'Único'})` });
+    }
 
+    const precio = producto.precio_unitario;
+    const ant = Number(anticipo) || 0;
+
+    // Crear pedido (PENDIENTE)
     const { data: pedido, error } = await supabase.from('pedidos').insert({
       cliente_nombre, cliente_dni, cliente_telefono,
-      producto_handle, cantidad,
-      precio_total: total, saldo_cobrar: saldo,
+      producto_handle, cantidad: 1, color: producto.color,
+      precio_total: precio, anticipo: ant,
       agencia_destino, agencia_id,
-      n_orden: n_orden || null, cod_seguimiento: cod_seguimiento || null,
       estado: 'PENDIENTE', notas
     }).select().single();
-
     if (error) throw error;
 
-    console.log(`[PEDIDO] #${pedido.id}: ${cliente_nombre} > ${producto.nombre_corto} x${cantidad}`);
+    console.log(`[PEDIDO] #${pedido.id}: ${cliente_nombre} > ${producto.grupo || producto.nombre_corto} (${producto.color})`);
 
-    // Crear la guía en Shalom AHORA (síncrono). En Cloud Run el CPU solo está
-    // garantizado durante la petición, así que NO lo dejamos en segundo plano.
+    // Crear la guía en Shalom AHORA (síncrono). El cliente paga el envío al recoger.
     const { generarEnvioShalomAPI } = require('./shalom_api_engine');
     try {
-      const guia = await generarEnvioShalomAPI(pedido, producto);
+      const guia = await generarEnvioShalomAPI({ ...pedido, origen_agencia: origen }, producto);
+      const envio = Number(guia.costo) || 0;
+      const yape = Math.max(0, Number((precio - ant - envio).toFixed(2)));  // lo que cobro por Yape
+
       await supabase.from('pedidos').update({
         n_orden: guia.n_orden,
         cod_seguimiento: guia.cod_seguimiento,
+        costo_envio: envio,
+        saldo_cobrar: yape,
         estado: 'ENVIADO'
       }).eq('id', pedido.id);
-      console.log(`[BOT-OK] Pedido #${pedido.id} -> ${guia.n_orden}`);
-      res.status(201).json({ success: true, pedido_id: pedido.id, n_orden: guia.n_orden, estado: 'ENVIADO', message: `Guía ${guia.n_orden} creada` });
+
+      // Descontar 1 del stock de esa variante
+      await supabase.from('productos').update({ stock: producto.stock - 1 }).eq('handle', producto_handle);
+
+      console.log(`[BOT-OK] #${pedido.id} -> ${guia.n_orden} | envío S/${envio} | yape S/${yape} | stock ${producto.stock - 1}`);
+      res.status(201).json({
+        success: true, pedido_id: pedido.id, n_orden: guia.n_orden, estado: 'ENVIADO',
+        precio, anticipo: ant, costo_envio: envio, a_cobrar_yape: yape,
+        stock_restante: producto.stock - 1,
+        message: `Guía ${guia.n_orden} creada · Yape S/${yape.toFixed(2)} (el cliente paga S/${envio} de envío al recoger)`
+      });
     } catch (e) {
       console.error(`[BOT-FAIL] #${pedido.id}:`, e.message);
       await supabase.from('pedidos').update({
@@ -178,6 +192,53 @@ app.get('/api/agencias', (req, res) => {
       ? agencias.filter(a => a.nombre.toLowerCase().includes(String(buscar).toLowerCase()))
       : agencias;
     res.json({ agencias: result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== STOCK / INVENTARIO (para el bot de WhatsApp del tío) ==========
+// GET /api/stock?buscar=porta platos  -> disponibilidad + colores + stock, agrupado
+app.get('/api/stock', async (req, res) => {
+  try {
+    const { buscar } = req.query;
+    const { data, error } = await supabase.from('productos').select('*').eq('activo', true);
+    if (error) throw error;
+
+    const term = String(buscar || '').toLowerCase().trim();
+    const match = term
+      ? data.filter(p =>
+          (p.grupo || '').toLowerCase().includes(term) ||
+          (p.nombre || '').toLowerCase().includes(term) ||
+          (p.nombre_corto || '').toLowerCase().includes(term))
+      : data;
+
+    // Agrupar por "grupo" (junta las variantes de color de un mismo producto)
+    const grupos = {};
+    for (const p of match) {
+      const g = p.grupo || p.nombre_corto || p.nombre;
+      if (!grupos[g]) {
+        grupos[g] = {
+          grupo: g,
+          categoria: p.categoria || null,
+          precio: p.precio_unitario,
+          vendible: !!p.caja_shalom,   // sin caja/medidas no se puede enviar por Shalom
+          colores: [],
+          stock_total: 0
+        };
+      }
+      grupos[g].colores.push({
+        color: p.color || 'Único',
+        stock: p.stock || 0,
+        disponible: (p.stock || 0) > 0,
+        sku: p.codigo,
+        handle: p.handle
+      });
+      grupos[g].stock_total += (p.stock || 0);
+    }
+
+    const productos = Object.values(grupos).sort((a, b) => a.grupo.localeCompare(b.grupo));
+    res.json({ encontrado: productos.length > 0, total: productos.length, productos });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

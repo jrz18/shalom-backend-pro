@@ -167,8 +167,9 @@ class ShalomAPI {
 
             // 1. Agencias origen y destino -> ter_id
             const terminals = (await this.request('/envia_ya/terminals')).Map || [];
-            const origen = this.findTerminal(terminals, ORIGEN_AGENCIA);
-            if (!origen) throw new Error(`No encontré la agencia de ORIGEN "${ORIGEN_AGENCIA}"`);
+            const origenNombre = pedido.origen_agencia || ORIGEN_AGENCIA;
+            const origen = this.findTerminal(terminals, origenNombre);
+            if (!origen) throw new Error(`No encontré la agencia de ORIGEN "${origenNombre}"`);
 
             // Destino: si el pedido trae el ter_id exacto (del selector), usarlo directo.
             // Si no, buscar por nombre (texto libre).
@@ -219,7 +220,7 @@ class ShalomAPI {
             const payload = {
                 origen: origen.ter_id,
                 destino: String(destino.ter_id),
-                tipo_pago: "REMITENTE",
+                tipo_pago: "DESTINATARIO",
                 tipo_producto: prodInfo.id,
                 tipo_producto_json: { value: costo, name: prodInfo.name, detalle: esOtraMedida ? "" : prodInfo.detalle },
                 cantidad: 1,
