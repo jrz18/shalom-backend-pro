@@ -18,6 +18,7 @@ const ORIGEN_AGENCIA = process.env.SHALOM_ORIGEN || "CANTO GRANDE";
 
 // Orígenes conocidos -> ter_id (evita depender de /envia_ya/terminals que a veces falla)
 const ORIGENES = {
+    'LOS PINOS': { ter_id: 411, lugar_over: 'LOS PINOS' },
     'CANTO GRANDE': { ter_id: 410, lugar_over: 'CANTO GRANDE' },
     'AV. PRINCIPAL': { ter_id: 432, lugar_over: 'AV. PRINCIPAL' },
     'AV PRINCIPAL': { ter_id: 432, lugar_over: 'AV. PRINCIPAL' }
