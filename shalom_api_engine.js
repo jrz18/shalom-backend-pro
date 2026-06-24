@@ -1,7 +1,11 @@
 const puppeteer = require('puppeteer-core');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+// API key pública de la firma anti-bot de Shalom (está fija en su frontend)
+const API_KEY_FIRMA = 'pk_over_5pg91gO6CSgmT627cf2sC8B7dqjxcLFQhW7HhnitKq3';
 
 // ===================== CONFIGURACIÓN =====================
 // Remitente fijo (la cuenta que envía). Sale del .env si existe.
@@ -11,6 +15,13 @@ const REMITENTE_DNI = String(process.env.SHALOM_REMITENTE_DNI || "47648778");
 // Agencia de ORIGEN fija (de dónde sale el paquete). Configurable por .env.
 // Se busca por nombre contra la lista de agencias de Shalom.
 const ORIGEN_AGENCIA = process.env.SHALOM_ORIGEN || "CANTO GRANDE";
+
+// Orígenes conocidos -> ter_id (evita depender de /envia_ya/terminals que a veces falla)
+const ORIGENES = {
+    'CANTO GRANDE': { ter_id: 410, lugar_over: 'CANTO GRANDE' },
+    'AV. PRINCIPAL': { ter_id: 432, lugar_over: 'AV. PRINCIPAL' },
+    'AV PRINCIPAL': { ter_id: 432, lugar_over: 'AV. PRINCIPAL' }
+};
 
 // Declaración jurada del contenido (obligatoria en Shalom).
 const DECLARACION_JURADA = process.env.SHALOM_DECLARACION || "Electrodomesticos";
@@ -54,13 +65,30 @@ class ShalomAPI {
         this.cookies = cookiesObj.map(c => `${c.name}=${c.value}`).join('; ');
         const xsrfCookie = cookiesObj.find(c => c.name === 'XSRF-TOKEN');
         this.xsrfToken = decodeURIComponent(xsrfCookie.value);
-        console.log("[API-ENGINE] ✅ Sesión obtenida");
+
+        // Secretos para la firma anti-bot (api-secret) y descifrado de respuestas (response-key)
+        const metas = await page.evaluate(() => ({
+            apiSecret: (document.querySelector('meta[name="api-secret"]') || {}).content || null,
+            responseKey: (document.querySelector('meta[name="response-key"]') || {}).content || null
+        }));
+        this.apiSecret = metas.apiSecret;
+        this.responseKey = metas.responseKey;
+        console.log(`[API-ENGINE] ✅ Sesión obtenida (firma: ${this.apiSecret ? 'sí' : 'NO'})`);
         await browser.close();
     }
 
     async request(path, body = {}, method = 'POST') {
         const url = `${this.baseUrl}${path}`;
         console.log(`[API-DEBUG] → ${method} ${path}`);
+
+        // Firma anti-bot de Shalom: mensaje = METHOD + path(sin "/") + timestamp + nonce; firma = HMAC-SHA256(mensaje, apiSecret)
+        const timestamp = Math.floor(Date.now() / 1000);
+        const nonce = Math.random().toString(36).substring(2, 10);
+        const mensaje = method.toUpperCase() + path.replace(/^\//, '') + timestamp + nonce;
+        const signature = this.apiSecret
+            ? crypto.createHmac('sha256', this.apiSecret).update(mensaje).digest('hex')
+            : '';
+
         const options = {
             method,
             headers: {
@@ -68,14 +96,38 @@ class ShalomAPI {
                 'Accept': 'application/json',
                 'X-XSRF-TOKEN': this.xsrfToken,
                 'Cookie': this.cookies,
-                'x-requested-with': 'XMLHttpRequest'
+                'x-requested-with': 'XMLHttpRequest',
+                'X-API-KEY': API_KEY_FIRMA,
+                'X-TIMESTAMP': String(timestamp),
+                'X-NONCE': nonce,
+                'X-SIGNATURE': signature
             }
         };
         if (method === 'POST') options.body = JSON.stringify(body);
         const response = await fetch(url, options);
-        const data = await response.json();
+        let data = await response.json();
+        // Shalom ahora ENCRIPTA las respuestas: {encrypted:true, data:"..."} -> descifrar
+        if (data && data.encrypted === true && data.data) {
+            data = this.decrypt(data.data) || data;
+        }
         console.log(`[API-DEBUG] ← ${path} [success: ${data.success}]`);
         return data;
+    }
+
+    // Descifra respuestas de Shalom: AES-256-CBC, IV = primeros 16 bytes, key = response-key (base64)
+    decrypt(dataB64) {
+        try {
+            const raw = Buffer.from(dataB64, 'base64');
+            const iv = raw.subarray(0, 16);
+            const ciphertext = raw.subarray(16);
+            const key = Buffer.from(this.responseKey, 'base64');
+            const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+            const dec = decipher.update(ciphertext, undefined, 'utf8') + decipher.final('utf8');
+            return JSON.parse(dec);
+        } catch (e) {
+            console.log('[API-ENGINE] ⚠️ No se pudo descifrar la respuesta:', e.message);
+            return null;
+        }
     }
 
     // Busca el ter_id de una agencia por nombre (difuso)
@@ -116,18 +168,23 @@ class ShalomAPI {
     // Usa el nombre OFICIAL por DNI (lo que Shalom valida); si no hay, cae al nombre del pedido.
     async registrarDestinatario(pedido) {
         const dni = String(pedido.cliente_dni);
-        let name, firstname, lastname;
 
+        // 1) Buscar si ya existe en Shalom -> devuelve su id (lo más confiable; ya descifrado)
+        const search = await this.request('/envia_ya/person/search', { documento: dni, type: 'receiver' });
+        if (search && search.success && search.data && search.data.id) {
+            const nom = search.data.full_name || search.data.name || dni;
+            console.log(`[API-ENGINE] ✅ Destinatario encontrado: ${nom} (ID ${search.data.id})`);
+            return search.data.id;
+        }
+
+        // 2) No existe -> registrarlo con el nombre OFICIAL (RENIEC), o el del pedido si no hay
+        let name, firstname, lastname;
         const oficial = await this.getNombreOficial(dni);
         if (oficial && oficial.nombres) {
-            // Formato que exige Shalom: name = apellidos, firstname = 1er nombre, lastname = resto
             const nombres = oficial.nombres.split(/\s+/);
-            name = oficial.apellidos;
-            firstname = nombres[0] || '';
-            lastname = nombres.slice(1).join(' ');
+            name = oficial.apellidos; firstname = nombres[0] || ''; lastname = nombres.slice(1).join(' ');
             console.log(`[API-ENGINE] 🪪 Nombre oficial RENIEC: ${oficial.apellidos} ${oficial.nombres}`);
         } else {
-            // Fallback: nombre tal cual vino en el pedido (texto libre, apellidos primero)
             const tokens = String(pedido.cliente_nombre || '').trim().split(/\s+/);
             if (tokens.length >= 4) { name = `${tokens[0]} ${tokens[1]}`; firstname = tokens[2]; lastname = tokens.slice(3).join(' '); }
             else if (tokens.length === 3) { name = `${tokens[0]} ${tokens[1]}`; firstname = tokens[2]; lastname = ''; }
@@ -135,15 +192,15 @@ class ShalomAPI {
             console.log(`[API-ENGINE] ⚠️ Sin dato RENIEC; uso el nombre del pedido: ${pedido.cliente_nombre}`);
         }
 
-        console.log(`[API-ENGINE] 📝 Registrando destinatario DNI ${dni}...`);
+        console.log(`[API-ENGINE] 📝 Registrando destinatario nuevo DNI ${dni}...`);
         const res = await this.request('/envia_ya/person/save', {
             documento: dni, name, firstname, lastname,
             phone: String(pedido.cliente_telefono || "")
         });
         if (!res.success || !res.data) {
-            throw new Error(`No se pudo registrar al destinatario (DNI ${dni}). ${oficial ? 'Shalom no aceptó el nombre RENIEC.' : 'No se obtuvo el nombre oficial; revisa el DNI.'} Respuesta de Shalom: ${res.message || 'sin detalle'}`);
+            throw new Error(`No se pudo registrar al destinatario (DNI ${dni}). Respuesta de Shalom: ${res.message || 'sin detalle'}`);
         }
-        console.log(`[API-ENGINE] ✅ Destinatario ID ${res.data.id}`);
+        console.log(`[API-ENGINE] ✅ Destinatario registrado ID ${res.data.id}`);
         return res.data.id;
     }
 
@@ -166,18 +223,27 @@ class ShalomAPI {
             await this.login();
 
             // 1. Agencias origen y destino -> ter_id
-            const terminals = (await this.request('/envia_ya/terminals')).Map || [];
-            const origenNombre = pedido.origen_agencia || ORIGEN_AGENCIA;
-            const origen = this.findTerminal(terminals, origenNombre);
-            if (!origen) throw new Error(`No encontré la agencia de ORIGEN "${origenNombre}"`);
+            // ORIGEN: del mapa de orígenes conocidos. DESTINO: del agencia_id del pedido.
+            // Solo si falta resolver algo por NOMBRE traemos la lista de Shalom (con reintentos).
+            const origenNombre = (pedido.origen_agencia || ORIGEN_AGENCIA || '').toUpperCase().trim();
+            let origen = ORIGENES[origenNombre] || null;
+            let destino = pedido.agencia_id
+                ? { ter_id: Number(pedido.agencia_id), lugar_over: pedido.agencia_destino || String(pedido.agencia_id) }
+                : null;
 
-            // Destino: si el pedido trae el ter_id exacto (del selector), usarlo directo.
-            // Si no, buscar por nombre (texto libre).
-            let destino = null;
-            if (pedido.agencia_id) {
-                destino = terminals.find(t => String(t.ter_id) === String(pedido.agencia_id));
+            if (!origen || !destino) {
+                let terminals = [];
+                for (let intento = 1; intento <= 4; intento++) {
+                    const t = await this.request('/envia_ya/terminals');
+                    if (t && Array.isArray(t.Map) && t.Map.length) { terminals = t.Map; break; }
+                    console.log(`[API-ENGINE] ⚠️ Lista de agencias vacía (intento ${intento}/4), reintentando...`);
+                    await delay(2500);
+                }
+                if (!terminals.length) throw new Error('Shalom no devolvió la lista de agencias (reintenta en un momento)');
+                if (!origen) { const o = this.findTerminal(terminals, origenNombre); if (o) origen = { ter_id: o.ter_id, lugar_over: o.lugar_over }; }
+                if (!destino) { const d = this.findTerminal(terminals, pedido.agencia_destino); if (d) destino = { ter_id: d.ter_id, lugar_over: d.lugar_over }; }
             }
-            if (!destino) destino = this.findTerminal(terminals, pedido.agencia_destino);
+            if (!origen) throw new Error(`No encontré la agencia de ORIGEN "${origenNombre}"`);
             if (!destino) throw new Error(`No encontré la agencia de DESTINO "${pedido.agencia_destino}"`);
             console.log(`[API-ENGINE] 📍 Origen ${origen.ter_id} (${origen.lugar_over}) → Destino ${destino.ter_id} (${destino.lugar_over})`);
 
