@@ -13,9 +13,15 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-// Iniciar servidor de inmediato (Cloud Run necesita esto)
+// Servir archivos estáticos del frontend si existen
+const frontendPath = path.join(__dirname, '..', 'shalom-frontend-pro');
+if (fs.existsSync(frontendPath)) {
+  app.use(express.static(frontendPath));
+}
+
+// Iniciar servidor de inmediato
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[SERVER] Shalom Backend Pro corriendo en puerto ${PORT}`);
+  console.log(`[SERVER] Shalom Backend Pro corriendo en http://localhost:${PORT}`);
 });
 
 // ========== SUPABASE ==========
@@ -77,10 +83,10 @@ app.post('/api/pedido', auth, async (req, res) => {
 
     console.log(`[PEDIDO] #${pedido.id}: ${cliente_nombre} > ${producto.grupo || producto.nombre_corto} (${producto.color})`);
 
-    // Crear la guía en Shalom AHORA (síncrono). El cliente paga el envío al recoger.
-    const { generarEnvioShalomAPI } = require('./shalom_api_engine');
+    // Crear la guía en Shalom AHORA usando el motor CDP (Chrome Detrás)
+    const { generarEnvioShalomCDP } = require('./shalom_cdp_api_engine');
     try {
-      const guia = await generarEnvioShalomAPI({ ...pedido, origen_agencia: origen }, producto);
+      const guia = await generarEnvioShalomCDP({ ...pedido, origen_agencia: origen }, producto);
       const envio = Number(guia.costo) || 0;
       const yape = Math.max(0, Number((precio - ant - envio).toFixed(2)));  // lo que cobro por Yape
 
