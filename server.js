@@ -21,7 +21,7 @@ if (fs.existsSync(frontendPath)) {
 
 // Iniciar servidor de inmediato
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[SERVER] Shalom Backend Pro corriendo en http://localhost:${PORT}`);
+  console.log(`[SERVER] Shalom Backend Pro corriendo en el puerto ${PORT}`);
 });
 
 // ========== SUPABASE ==========
@@ -83,10 +83,12 @@ app.post('/api/pedido', auth, async (req, res) => {
 
     console.log(`[PEDIDO] #${pedido.id}: ${cliente_nombre} > ${producto.grupo || producto.nombre_corto} (${producto.color})`);
 
-    // Crear la guía en Shalom AHORA usando el motor CDP (Chrome Detrás)
-    const { generarEnvioShalomCDP } = require('./shalom_cdp_api_engine');
+    // Motor de envío: 'http' (nube, sin navegador, sesión sincronizada en Supabase) o CDP (local, Chrome real).
+    const generarEnvio = process.env.SHALOM_ENGINE === 'http'
+      ? require('./shalom_api_engine').generarEnvioShalomAPI
+      : require('./shalom_cdp_api_engine').generarEnvioShalomCDP;
     try {
-      const guia = await generarEnvioShalomCDP({ ...pedido, origen_agencia: origen }, producto);
+      const guia = await generarEnvio({ ...pedido, origen_agencia: origen }, producto);
       const envio = Number(guia.costo) || 0;
       const yape = Math.max(0, Number((precio - ant - envio).toFixed(2)));  // lo que cobro por Yape
 
@@ -101,7 +103,7 @@ app.post('/api/pedido', auth, async (req, res) => {
       // Descontar 1 del stock de esa variante
       await supabase.from('productos').update({ stock: producto.stock - 1 }).eq('handle', producto_handle);
 
-      console.log(`[BOT-OK] #${pedido.id} -> ${guia.n_orden} | envío S/${envio} | yape S/${yape} | stock ${producto.stock - 1}`);
+      console.log(`[BOT-OK] #${pedido.id} -> ${guia.n_orden} | envio S/${envio} | yape S/${yape} | stock ${producto.stock - 1}`);
       res.status(201).json({
         success: true, pedido_id: pedido.id, n_orden: guia.n_orden, estado: 'ENVIADO',
         precio, anticipo: ant, costo_envio: envio, a_cobrar_yape: yape,

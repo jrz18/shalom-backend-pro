@@ -46,13 +46,46 @@ class ShalomAPI {
         this.baseUrl = "https://pro.shalom.pe";
     }
 
+    async loadRemoteSession() {
+        try {
+            console.log("[API-ENGINE] Intentando cargar sesion remota desde Supabase...");
+            const { createClient } = require('@supabase/supabase-js');
+            const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+            const { data, error } = await supabase.from('bot_session').select('*').eq('id', 1).single();
+            
+            if (error || !data || !data.cookies) {
+                console.log("[API-ENGINE] No hay sesion remota valida.");
+                return false;
+            }
+
+            this.cookies = data.cookies;
+            this.xsrfToken = data.xsrf_token;
+            this.apiSecret = data.api_secret;
+            this.responseKey = data.response_key;
+            console.log("[API-ENGINE] Sesion remota cargada con exito.");
+            return true;
+        } catch (e) {
+            console.log("[API-ENGINE] Aviso: Error cargando sesion remota:", e.message);
+            return false;
+        }
+    }
+
     async login() {
-        console.log("[API-ENGINE] 🔑 Iniciando sesión...");
+        // Primero intentamos cargar la sesion remota para evitar el login (bypass reCAPTCHA)
+        const remote = await this.loadRemoteSession();
+        if (remote) return;
+
+        // En la nube no hay navegador: si no hay sesion remota valida, fallar claro (la PC local
+        // debe re-sincronizar con prep_login). Evita intentar un puppeteer.launch que no funciona alla.
+        if (process.env.SHALOM_NO_LAUNCH === '1') {
+            throw new Error("Sesion remota invalida/expirada en Supabase. La PC local debe re-sincronizar (prep_login).");
+        }
+
+        console.log("[API-ENGINE] Iniciando sesion manual (Puppeteer)...");
         const browser = await puppeteer.launch({
             executablePath: process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
             headless: true,
             timeout: 60000,
-            // Flags necesarios para que Chrome arranque dentro de contenedores (Cloud Run)
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote']
         });
         const page = await browser.newPage();
@@ -67,14 +100,13 @@ class ShalomAPI {
         const xsrfCookie = cookiesObj.find(c => c.name === 'XSRF-TOKEN');
         this.xsrfToken = decodeURIComponent(xsrfCookie.value);
 
-        // Secretos para la firma anti-bot (api-secret) y descifrado de respuestas (response-key)
         const metas = await page.evaluate(() => ({
             apiSecret: (document.querySelector('meta[name="api-secret"]') || {}).content || null,
             responseKey: (document.querySelector('meta[name="response-key"]') || {}).content || null
         }));
         this.apiSecret = metas.apiSecret;
         this.responseKey = metas.responseKey;
-        console.log(`[API-ENGINE] ✅ Sesión obtenida (firma: ${this.apiSecret ? 'sí' : 'NO'})`);
+        console.log(`[API-ENGINE] Sesion obtenida (firma: ${this.apiSecret ? 'si' : 'NO'})`);
         await browser.close();
     }
 
@@ -126,7 +158,7 @@ class ShalomAPI {
             const dec = decipher.update(ciphertext, undefined, 'utf8') + decipher.final('utf8');
             return JSON.parse(dec);
         } catch (e) {
-            console.log('[API-ENGINE] ⚠️ No se pudo descifrar la respuesta:', e.message);
+            console.log('[API-ENGINE] Aviso: No se pudo descifrar la respuesta:', e.message);
             return null;
         }
     }
@@ -157,52 +189,48 @@ class ShalomAPI {
             if (!d || !d.nombres) return null;
             return {
                 apellidos: `${d.apellidoPaterno || ''} ${d.apellidoMaterno || ''}`.trim(),
+                apellidoPaterno: d.apellidoPaterno || '',
+                apellidoMaterno: d.apellidoMaterno || '',
                 nombres: String(d.nombres).trim()
             };
         } catch (e) {
-            console.log(`[API-ENGINE] ⚠️ No se pudo consultar RENIEC (DNI ${dni}): ${e.message}`);
+            console.log(`[API-ENGINE] Aviso: No se pudo consultar RENIEC (DNI ${dni}): ${e.message}`);
             return null;
         }
     }
 
-    // Registra/actualiza al destinatario y devuelve su id.
-    // Usa el nombre OFICIAL por DNI (lo que Shalom valida); si no hay, cae al nombre del pedido.
-    async registrarDestinatario(pedido) {
+    // Devuelve el destinatario_uuid (API nueva /service-orders/recipients). Si el destinatario no
+    // esta en la cuenta, lo registra con recipients/save (nombre oficial RENIEC) y devuelve el uuid.
+    async obtenerDestinatarioUuid(pedido) {
         const dni = String(pedido.cliente_dni);
 
-        // 1) Buscar si ya existe en Shalom -> devuelve su id (lo más confiable; ya descifrado)
-        const search = await this.request('/envia_ya/person/search', { documento: dni, type: 'receiver' });
-        if (search && search.success && search.data && search.data.id) {
-            const nom = search.data.full_name || search.data.name || dni;
-            console.log(`[API-ENGINE] ✅ Destinatario encontrado: ${nom} (ID ${search.data.id})`);
-            return search.data.id;
+        // 1) Buscar el contacto en tu cuenta -> devuelve su uuid
+        let r = await this.request('/service-orders/recipients/search', { document: dni });
+        if (r && r.success && r.data && r.data.uuid) {
+            console.log(`[API-ENGINE] Destinatario encontrado (uuid ${r.data.uuid})`);
+            return r.data.uuid;
         }
 
-        // 2) No existe -> registrarlo con el nombre OFICIAL (RENIEC), o el del pedido si no hay
-        let name, firstname, lastname;
+        // 2) No existe -> registrarlo. Nombres por RENIEC: first_name=nombres, last_name=ap.paterno, surname=ap.materno
         const oficial = await this.getNombreOficial(dni);
-        if (oficial && oficial.nombres) {
-            const nombres = oficial.nombres.split(/\s+/);
-            name = oficial.apellidos; firstname = nombres[0] || ''; lastname = nombres.slice(1).join(' ');
-            console.log(`[API-ENGINE] 🪪 Nombre oficial RENIEC: ${oficial.apellidos} ${oficial.nombres}`);
-        } else {
-            const tokens = String(pedido.cliente_nombre || '').trim().split(/\s+/);
-            if (tokens.length >= 4) { name = `${tokens[0]} ${tokens[1]}`; firstname = tokens[2]; lastname = tokens.slice(3).join(' '); }
-            else if (tokens.length === 3) { name = `${tokens[0]} ${tokens[1]}`; firstname = tokens[2]; lastname = ''; }
-            else { name = tokens[0] || ''; firstname = tokens[1] || ''; lastname = ''; }
-            console.log(`[API-ENGINE] ⚠️ Sin dato RENIEC; uso el nombre del pedido: ${pedido.cliente_nombre}`);
+        const tokens = String(pedido.cliente_nombre || '').trim().split(/\s+/).filter(Boolean);
+        const body = {
+            document: dni,
+            first_name: (oficial && oficial.nombres) || tokens.slice(0, 2).join(' ') || 'CLIENTE',
+            last_name: (oficial && oficial.apellidoPaterno) || tokens[2] || tokens[0] || '',
+            surname: (oficial && oficial.apellidoMaterno) || tokens[3] || '',
+            phone: String(pedido.cliente_telefono || "999999999")
+        };
+        console.log(`[API-ENGINE] Registrando destinatario nuevo DNI ${dni} (recipients/save)...`);
+        const saved = await this.request('/service-orders/recipients/save', body);
+        let uuid = (saved && saved.data && saved.data.uuid) ? saved.data.uuid : (saved && saved.uuid) ? saved.uuid : null;
+        if (!uuid) {
+            r = await this.request('/service-orders/recipients/search', { document: dni });
+            uuid = (r && r.data && r.data.uuid) ? r.data.uuid : null;
         }
-
-        console.log(`[API-ENGINE] 📝 Registrando destinatario nuevo DNI ${dni}...`);
-        const res = await this.request('/envia_ya/person/save', {
-            documento: dni, name, firstname, lastname,
-            phone: String(pedido.cliente_telefono || "")
-        });
-        if (!res.success || !res.data) {
-            throw new Error(`No se pudo registrar al destinatario (DNI ${dni}). Respuesta de Shalom: ${res.message || 'sin detalle'}`);
-        }
-        console.log(`[API-ENGINE] ✅ Destinatario registrado ID ${res.data.id}`);
-        return res.data.id;
+        if (!uuid) throw new Error(`No se pudo registrar al destinatario (DNI ${dni}): ${(saved && saved.message) || 'sin uuid'}`);
+        console.log(`[API-ENGINE] Destinatario registrado (uuid ${uuid})`);
+        return uuid;
     }
 
     // Obtiene info del producto (id, nombre, detalle, clave de tarifa)
@@ -237,7 +265,7 @@ class ShalomAPI {
                 for (let intento = 1; intento <= 4; intento++) {
                     const t = await this.request('/envia_ya/terminals');
                     if (t && Array.isArray(t.Map) && t.Map.length) { terminals = t.Map; break; }
-                    console.log(`[API-ENGINE] ⚠️ Lista de agencias vacía (intento ${intento}/4), reintentando...`);
+                    console.log(`[API-ENGINE] Aviso: Lista de agencias vacia (intento ${intento}/4), reintentando...`);
                     await delay(2500);
                 }
                 if (!terminals.length) throw new Error('Shalom no devolvió la lista de agencias (reintenta en un momento)');
@@ -246,10 +274,10 @@ class ShalomAPI {
             }
             if (!origen) throw new Error(`No encontré la agencia de ORIGEN "${origenNombre}"`);
             if (!destino) throw new Error(`No encontré la agencia de DESTINO "${pedido.agencia_destino}"`);
-            console.log(`[API-ENGINE] 📍 Origen ${origen.ter_id} (${origen.lugar_over}) → Destino ${destino.ter_id} (${destino.lugar_over})`);
+            console.log(`[API-ENGINE] Origen ${origen.ter_id} (${origen.lugar_over}) -> Destino ${destino.ter_id} (${destino.lugar_over})`);
 
-            // 2. Destinatario
-            const receiverId = await this.registrarDestinatario(pedido);
+            // 2. Destinatario -> uuid (API nueva)
+            const destinatarioUuid = await this.obtenerDestinatarioUuid(pedido);
 
             // 3. Producto
             const prodInfo = await this.getProductInfo(producto.caja_shalom);
@@ -281,48 +309,46 @@ class ShalomAPI {
                 if (precio == null) throw new Error(`Shalom no tiene tarifa "${prodInfo.tariffKey}" para esta ruta`);
                 costo = Number(precio).toFixed(2);
             }
-            console.log(`[API-ENGINE] 💰 Tarifa ${prodInfo.name}: S/ ${costo}`);
+            console.log(`[API-ENGINE] Tarifa ${prodInfo.name}: S/ ${costo}`);
 
-            // 6. Crear la orden
+            // 6. Crear la orden (formato NUEVO: destinatario_uuid, sin ids numericos ni remitente;
+            // el remitente es implicito de la sesion). declaracion_jurada ya no es obligatoria.
             const payload = {
                 origen: origen.ter_id,
-                destino: String(destino.ter_id),
-                tipo_pago: "DESTINATARIO",
+                destino: Number(destino.ter_id),
+                tipo_pago: process.env.SHALOM_TIPO_PAGO || "DESTINATARIO",
                 tipo_producto: prodInfo.id,
                 tipo_producto_json: { value: costo, name: prodInfo.name, detalle: esOtraMedida ? "" : prodInfo.detalle },
                 cantidad: 1,
                 peso: dims.peso, alto: dims.alto, largo: dims.largo, ancho: dims.ancho,
                 costo: costo,
-                remitente: REMITENTE_DNI,
-                destinatario: String(pedido.cliente_dni),
-                remitente_id: REMITENTE_ID,
-                destinatario_id: receiverId,
+                destinatario_uuid: destinatarioUuid,
                 garantia: 0,
                 garantia_costo: 0,
                 garantia_monto: "0.00",
+                contact_extra_uuid: null,
                 contacto_doc: "",
                 grrs: "[]",
                 clave: String(process.env.SHALOM_PIN || "1812"),
                 aereo: 0,
                 servicio_cobranza: 0,
                 servicio_cobranza_costo: 0,
-                servicio_cobranza_datos: JSON.stringify({ document: "", name: "", bank: "", type_account: "", account_number: "", cci: "" }),
-                declaracion_jurada: DECLARACION_JURADA
+                declaracion_jurada: process.env.SHALOM_DECLARACION || ""
             };
 
-            console.log("[API-ENGINE] 🚀 Creando orden de envío...");
+            console.log("[API-ENGINE] Enviando orden de envio...");
             let result = await this.request('/envia_ya/service_order/save', payload);
 
             // Respaldo: si Shalom rechaza por el modo de servicio, reintentar con el otro (terrestre <-> aéreo)
             if (!result.success && /a[eé]reo|terrestre|servicio/i.test(result.message || '')) {
                 payload.aereo = payload.aereo ? 0 : 1;
-                console.log(`[API-ENGINE] 🔄 Modo de servicio rechazado; reintentando con aereo=${payload.aereo}...`);
+                console.log(`[API-ENGINE] Modo de servicio rechazado; reintentando con aereo=${payload.aereo}...`);
                 result = await this.request('/envia_ya/service_order/save', payload);
             }
 
             if (result.success && result.data) {
                 const nOrden = `${result.data.serie}-${result.data.guia}`;
-                console.log(`[API-ENGINE] 🎉 ÉXITO: Guía ${nOrden} (cód ${result.data.codigo})`);
+                console.log(`[API-ENGINE] EXITO: Guia ${nOrden} (cod ${result.data.codigo})`);
                 return {
                     n_orden: nOrden,
                     cod_seguimiento: result.data.codigo,
@@ -330,10 +356,10 @@ class ShalomAPI {
                 };
             }
 
-            console.log("[API-ENGINE] 📦 Respuesta:", JSON.stringify(result));
+            console.log("[API-ENGINE] Respuesta:", JSON.stringify(result));
             throw new Error(result.message || "Error desconocido al crear la orden");
         } catch (err) {
-            console.error("[API-ENGINE] ❌ Fallo:", err.message);
+            console.error("[API-ENGINE] Fallo:", err.message);
             throw err;
         }
     }

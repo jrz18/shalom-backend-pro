@@ -5,3 +5,8 @@ screenshots/
 *.log
 captura-pedido.json
 captura-*.json
+# Scripts de prueba/diagnóstico con datos reales (no subir)
+test_cdp.js
+probe_*.js
+app_shalom.js
+*.har
